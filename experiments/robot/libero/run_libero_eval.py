@@ -21,8 +21,10 @@ from libero.libero import benchmark
 
 import wandb
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
+# Add the repository root so imports work regardless of the current working directory.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
