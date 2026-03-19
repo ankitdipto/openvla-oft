@@ -9,17 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import json_numpy
 import numpy as np
 import requests
-import tensorflow as tf
 import torch
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, scan_cache_dir
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
-# Apply JSON numpy patch for serialization
-json_numpy.patch()
+# Keep the evaluation flow on the PyTorch path; otherwise transformers may try
+# to import TensorFlow image helpers opportunistically if TensorFlow is installed.
+os.environ.setdefault("USE_TF", "0")
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -30,8 +29,8 @@ from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NormalizationType,
 )
-from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
 # Initialize important constants
 DATE = time.strftime("%Y_%m_%d")
@@ -45,12 +44,41 @@ np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Checks whether a model path points to a model on Hugging Face Hub."""
+    if os.path.isdir(model_path):
+        return False
+
+    if repo_is_cached_locally(model_path):
+        return True
+
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        return False
+
     # If the API call below runs without error, the model is on the hub
     try:
-        HfApi().model_info(model_path)
+        HfApi().model_info(model_path, timeout=3)
         return True
     except Exception:
         return False
+
+
+def repo_is_cached_locally(model_path: str) -> bool:
+    """Checks whether a Hugging Face repo already exists in the local cache."""
+    if os.path.isdir(model_path):
+        return False
+
+    try:
+        cache_info = scan_cache_dir()
+        return any(repo.repo_id == model_path for repo in cache_info.repos)
+    except Exception:
+        return False
+
+
+def should_use_local_files_only(model_path: str) -> bool:
+    """Prefer cached checkpoint files when they already exist locally or offline mode is enabled."""
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        return True
+
+    return repo_is_cached_locally(model_path)
 
 
 def update_auto_map(pretrained_checkpoint: str) -> None:
@@ -71,20 +99,23 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
         print(f"Warning: No config.json found at {config_path}")
         return
 
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    desired_auto_map = {
+        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
+        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
+    }
+    if config.get("auto_map") == desired_auto_map:
+        return
+
     # Create timestamped backup
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}")
     shutil.copy2(config_path, backup_path)
     print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
 
-    # Read and update the config
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    config["auto_map"] = {
-        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
-        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
-    }
+    config["auto_map"] = desired_auto_map
 
     # Write back the updated config
     with open(config_path, "w") as f:
@@ -286,6 +317,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
         low_cpu_mem_usage=True,
+        local_files_only=should_use_local_files_only(cfg.pretrained_checkpoint),
         trust_remote_code=True,
     )
 
@@ -387,7 +419,11 @@ def get_processor(cfg: Any) -> AutoProcessor:
     Returns:
         AutoProcessor: The model's processor
     """
-    return AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    return AutoProcessor.from_pretrained(
+        cfg.pretrained_checkpoint,
+        local_files_only=should_use_local_files_only(cfg.pretrained_checkpoint),
+        trust_remote_code=True,
+    )
 
 
 def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioProjector:
@@ -423,7 +459,9 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
         # Download proprio projector directly from HF Hub
         proprio_projector_path = hf_hub_download(
-            repo_id=cfg.pretrained_checkpoint, filename=model_path_to_proprio_projector_name[cfg.pretrained_checkpoint]
+            repo_id=cfg.pretrained_checkpoint,
+            filename=model_path_to_proprio_projector_name[cfg.pretrained_checkpoint],
+            local_files_only=should_use_local_files_only(cfg.pretrained_checkpoint),
         )
         state_dict = load_component_state_dict(proprio_projector_path)
         proprio_projector.load_state_dict(state_dict)
@@ -505,7 +543,9 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
         # Download proprio projector directly from HF Hub
         action_head_path = hf_hub_download(
-            repo_id=cfg.pretrained_checkpoint, filename=model_path_to_action_head_name[cfg.pretrained_checkpoint]
+            repo_id=cfg.pretrained_checkpoint,
+            filename=model_path_to_action_head_name[cfg.pretrained_checkpoint],
+            local_files_only=should_use_local_files_only(cfg.pretrained_checkpoint),
         )
         state_dict = load_component_state_dict(action_head_path)
         action_head.load_state_dict(state_dict)
@@ -534,63 +574,10 @@ def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, 
     if isinstance(resize_size, int):
         resize_size = (resize_size, resize_size)
 
-    # Resize using the same pipeline as in RLDS dataset builder
-    img = tf.image.encode_jpeg(img)  # Encode as JPEG
-    img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Decode back
-    img = tf.image.resize(img, resize_size, method="lanczos3", antialias=True)
-    img = tf.cast(tf.clip_by_value(tf.round(img), 0, 255), tf.uint8)
-
-    return img.numpy()
-
-
-def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.Tensor:
-    """
-    Center-crop an image and resize it back to original dimensions.
-
-    Uses the same logic as in the training data pipeline for distribution matching.
-
-    Args:
-        image: TF Tensor of shape (batch_size, H, W, C) or (H, W, C) with values in [0,1]
-        crop_scale: Area of center crop relative to original image
-        batch_size: Batch size
-
-    Returns:
-        tf.Tensor: The cropped and resized image
-    """
-    # Handle 3D inputs by adding batch dimension if needed
-    assert image.shape.ndims in (3, 4), "Image must be 3D or 4D tensor"
-    expanded_dims = False
-    if image.shape.ndims == 3:
-        image = tf.expand_dims(image, axis=0)
-        expanded_dims = True
-
-    # Calculate crop dimensions (note: we use sqrt(crop_scale) for h/w)
-    new_heights = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
-    new_widths = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
-
-    # Create bounding box for the crop
-    height_offsets = (1 - new_heights) / 2
-    width_offsets = (1 - new_widths) / 2
-    bounding_boxes = tf.stack(
-        [
-            height_offsets,
-            width_offsets,
-            height_offsets + new_heights,
-            width_offsets + new_widths,
-        ],
-        axis=1,
-    )
-
-    # Apply crop and resize
-    image = tf.image.crop_and_resize(
-        image, bounding_boxes, tf.range(batch_size), (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE)
-    )
-
-    # Remove batch dimension if it was added
-    if expanded_dims:
-        image = image[0]
-
-    return image
+    # Use a PIL-based resize path for evaluation to avoid pulling in TensorFlow.
+    pil_img = Image.fromarray(img).convert("RGB")
+    pil_img = pil_img.resize((resize_size[1], resize_size[0]), resample=Image.Resampling.LANCZOS)
+    return np.asarray(pil_img, dtype=np.uint8)
 
 
 def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
@@ -603,27 +590,19 @@ def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
     Returns:
         Image.Image: Cropped PIL Image
     """
-    batch_size = 1
     crop_scale = 0.9
+    image_np = np.asarray(image, dtype=np.uint8)
+    height, width = image_np.shape[:2]
+    scale = float(np.sqrt(crop_scale))
+    crop_height = max(1, int(round(height * scale)))
+    crop_width = max(1, int(round(width * scale)))
+    top = max(0, (height - crop_height) // 2)
+    left = max(0, (width - crop_width) // 2)
+    cropped = image_np[top : top + crop_height, left : left + crop_width]
 
-    # Convert to TF Tensor if needed
-    if not isinstance(image, tf.Tensor):
-        image = tf.convert_to_tensor(np.array(image))
-
-    orig_dtype = image.dtype
-
-    # Convert to float32 in range [0,1]
-    image = tf.image.convert_image_dtype(image, tf.float32)
-
-    # Apply center crop and resize
-    image = crop_and_resize(image, crop_scale, batch_size)
-
-    # Convert back to original data type
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
-
-    # Convert to PIL Image
-    return Image.fromarray(image.numpy()).convert("RGB")
+    return Image.fromarray(cropped).convert("RGB").resize(
+        (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE), resample=Image.Resampling.LANCZOS
+    )
 
 
 def check_image_format(image: Any) -> None:
