@@ -225,7 +225,7 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = re.sub(r"[^a-z0-9_]+", "_", task_description.lower())
     processed_task_description = processed_task_description.strip("_")[:50] or "task"
-    mp4_path = f"{rollout_dir}/{DATE_TIME}--openvla_oft--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    mp4_path = f"{rollout_dir}/{DATE_TIME}.eps{idx}.mp4"
     imageio.mimwrite(mp4_path, rollout_images, fps=20)
     log_message(f"Saved rollout video to {mp4_path}", log_file)
 
@@ -316,7 +316,7 @@ def initialize_model(cfg: GenerateConfig):
     return model, processor, action_head, proprio_projector, noisy_action_projector
 
 
-@draccus.wrap()
+@draccus.wrap() # type: ignore
 def eval_robocasa(cfg: GenerateConfig) -> float:
     validate_config(cfg)
     set_seed_everywhere(cfg.seed)
@@ -372,4 +372,4 @@ def eval_robocasa(cfg: GenerateConfig) -> float:
 
 
 if __name__ == "__main__":
-    eval_robocasa()
+    eval_robocasa() # type: ignore
