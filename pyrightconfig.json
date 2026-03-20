@@ -1,0 +1,11 @@
+{
+  "include": ["**/*.py"],
+  "exclude": ["**/__pycache__"],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "pythonVersion": "3.10",
+  "extraPaths": [
+    "../robocasa",
+    "../robosuite"
+  ]
+}
