@@ -230,6 +230,19 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
     log_message(f"Saved rollout video to {mp4_path}", log_file)
 
 
+def compose_rollout_frame(obs) -> np.ndarray:
+    """Compose a side-by-side rollout frame with third-person and wrist views."""
+    third_person = np.asarray(obs["video.robot0_agentview_left"], dtype=np.uint8)
+    wrist = np.asarray(obs["video.robot0_eye_in_hand"], dtype=np.uint8)
+
+    if third_person.shape[0] != wrist.shape[0]:
+        raise ValueError(
+            "Expected RoboCasa rollout cameras to share the same height for side-by-side video composition."
+        )
+
+    return np.concatenate((third_person, wrist), axis=1)
+
+
 def run_episode(
     cfg: GenerateConfig,
     env,
@@ -251,7 +264,7 @@ def run_episode(
 
     for t in range(cfg.max_steps):
         observation = prepare_observation(obs, resize_size, cfg.use_proprio)
-        replay_images.append(obs["video.robot0_agentview_left"])
+        replay_images.append(compose_rollout_frame(obs))
 
         if len(action_queue) == 0:
             actions = get_action(
