@@ -142,6 +142,89 @@ cd /storage/ice1/4/5/asinha389/VLA_RL/openvla-oft
   --run_id_note long_rollout_video
 ```
 
+## Running RoboCasa Fine-Tuning
+
+A native LeRobot-backed RoboCasa training path is now available through the main `vla-scripts/finetune.py` entrypoint.
+
+Use the new dataset backend flag:
+
+- `data_backend=lerobot`
+
+For the current thin training integration, `data_root_dir` should point directly to a RoboCasa LeRobot dataset root, for example:
+
+- `/storage/ice1/4/5/asinha389/VLA_RL/robocasa/datasets/v1.0/target/atomic/PickPlaceCounterToCabinet/20250811/lerobot`
+
+The training path currently:
+
+- reads RoboCasa LeRobot `meta/`, `data/*.parquet`, and `videos/*.mp4` directly
+- uses `robot0_agentview_left` as the primary image
+- uses `robot0_eye_in_hand` as the optional wrist image
+- maps RoboCasa actions to the 7D OpenVLA-OFT arm action expected by the evaluator
+- saves an OpenVLA-compatible `dataset_statistics.json` so the resulting checkpoint can be evaluated with a RoboCasa-specific `unnorm_key`
+
+### Example Single-Task RoboCasa Fine-Tuning Command
+
+Use `torchrun`, matching the upstream `openvla-oft` training flow:
+
+```bash
+cd /storage/ice1/4/5/asinha389/VLA_RL/openvla-oft
+
+/storage/ice1/4/5/asinha389/.conda/envs/opvla_rbcasa/bin/torchrun \
+  --standalone --nnodes 1 --nproc-per-node 1 \
+  vla-scripts/finetune.py \
+  --vla_path openvla/openvla-7b \
+  --data_backend lerobot \
+  --data_root_dir /storage/ice1/4/5/asinha389/VLA_RL/robocasa/datasets/v1.0/target/atomic/PickPlaceCounterToCabinet/20250811/lerobot \
+  --dataset_name robocasa_pickplace_counter_to_cabinet \
+  --run_root_dir runs/robocasa \
+  --use_l1_regression True \
+  --use_diffusion False \
+  --use_proprio False \
+  --num_images_in_input 1 \
+  --batch_size 8 \
+  --grad_accumulation_steps 1 \
+  --max_steps 10000 \
+  --save_freq 1000 \
+  --wandb_project openvla-oft-robocasa \
+  --run_id_note robocasa_pickplace
+```
+
+### Validated Smoke Test Command
+
+This shorter command was validated locally on the RoboCasa LeRobot dataset with per-iteration timing enabled:
+
+```bash
+cd /storage/ice1/4/5/asinha389/VLA_RL/openvla-oft
+
+WANDB_MODE=disabled /storage/ice1/4/5/asinha389/.conda/envs/opvla_rbcasa/bin/torchrun \
+  --standalone --nnodes 1 --nproc-per-node 1 \
+  vla-scripts/finetune.py \
+  --vla_path moojink/openvla-7b-oft-finetuned-libero-10 \
+  --data_backend lerobot \
+  --data_root_dir /storage/ice1/4/5/asinha389/VLA_RL/robocasa/datasets/v1.0/target/atomic/PickPlaceCounterToCabinet/20250811/lerobot \
+  --dataset_name robocasa_pickplace_counter_to_cabinet \
+  --run_root_dir runs/robocasa_smoke \
+  --use_l1_regression True \
+  --use_diffusion False \
+  --use_proprio False \
+  --num_images_in_input 1 \
+  --batch_size 1 \
+  --grad_accumulation_steps 1 \
+  --max_steps 3 \
+  --save_freq 100 \
+  --wandb_project openvla-oft-robocasa \
+  --run_id_note smoke_timed \
+  --log_step_timing True
+```
+
+### Evaluating a RoboCasa-Finetuned Checkpoint
+
+If the checkpoint was trained with the example command above, the RoboCasa evaluator should use:
+
+- `--unnorm_key robocasa_pickplace_counter_to_cabinet`
+
+This works because the LeRobot training backend saves `dataset_statistics.json` with that dataset key.
+
 ## Current Status
 
 The integration is working at the infrastructure level:

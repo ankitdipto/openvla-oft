@@ -6,6 +6,9 @@ Fine-tunes OpenVLA via LoRA.
 
 import os
 import time
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,8 +61,7 @@ from prismatic.vla.constants import (
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
 )
-from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
-from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.vla.datasets.statistics import save_dataset_statistics
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -967,32 +969,66 @@ def finetune(cfg: FinetuneConfig) -> None:
     use_wrist_image = cfg.num_images_in_input > 1
 
     # Create training and optional validation datasets
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder,
-        use_wrist_image=use_wrist_image,
-        use_proprio=cfg.use_proprio,
-    )
-    train_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
-    if cfg.use_val_set:
-        val_dataset = RLDSDataset(
+    if cfg.data_backend == "rlds":
+        from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+
+        batch_transform = RLDSBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            use_wrist_image=use_wrist_image,
+            use_proprio=cfg.use_proprio,
+        )
+        train_dataset = RLDSDataset(
             cfg.data_root_dir,
             cfg.dataset_name,
             batch_transform,
             resize_resolution=tuple(vla.module.config.image_sizes),
-            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
             image_aug=cfg.image_aug,
-            train=False,
         )
+        if cfg.use_val_set:
+            val_dataset = RLDSDataset(
+                cfg.data_root_dir,
+                cfg.dataset_name,
+                batch_transform,
+                resize_resolution=tuple(vla.module.config.image_sizes),
+                shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
+                image_aug=cfg.image_aug,
+                train=False,
+            )
+        dataloader_num_workers = 0
+    elif cfg.data_backend == "lerobot":
+        from prismatic.vla.datasets import LeRobotBatchTransform, LeRobotDataset
+
+        batch_transform = LeRobotBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            use_wrist_image=use_wrist_image,
+            use_proprio=cfg.use_proprio,
+        )
+        train_dataset = LeRobotDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+        )
+        if cfg.use_val_set:
+            val_dataset = LeRobotDataset(
+                cfg.data_root_dir,
+                cfg.dataset_name,
+                batch_transform,
+                shuffle_buffer_size=max(cfg.shuffle_buffer_size // 10, 1),
+                image_aug=False,
+                train=False,
+            )
+        dataloader_num_workers = 0
+    else:
+        raise ValueError(f"Unsupported data backend: {cfg.data_backend}")
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
