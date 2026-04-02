@@ -7,6 +7,7 @@ Fine-tunes OpenVLA via LoRA.
 import os
 import re
 import time
+from pathlib import Path
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -38,6 +39,7 @@ from experiments.robot.openvla_utils import (
 from utilities import (
     FinetuneConfig, 
     load_checkpoint, 
+    load_base_model_path_from_checkpoint,
     wrap_ddp, 
     count_parameters,
     run_diffusion_sampling,
@@ -46,11 +48,15 @@ from utilities import (
     save_training_checkpoint,
     load_trainer_state,
     move_optimizer_state_to_device,
+    override_optimizer_and_scheduler_lr,
     remove_ddp_in_checkpoint,
     get_run_id,
     log_metrics_to_wandb,
     save_training_checkpoint,
     infer_resume_step,
+    load_latest_local_wandb_step,
+    load_wandb_run_id,
+    save_wandb_run_id,
 )
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
@@ -404,9 +410,15 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
+    base_model_reference = cfg.vla_path
+    recorded_base_model_path = None
     if cfg.resume and cfg.resume_step is None:
         cfg.resume_step = infer_resume_step(cfg.vla_path)
         print(f"Inferred resume step: {cfg.resume_step}")
+    if cfg.resume:
+        recorded_base_model_path = load_base_model_path_from_checkpoint(cfg.vla_path)
+        if recorded_base_model_path is not None:
+            base_model_reference = recorded_base_model_path.rstrip("/")
 
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
@@ -425,7 +437,33 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        wandb_kwargs = {
+            "entity": cfg.wandb_entity,
+            "project": cfg.wandb_project,
+            "name": f"ft+{run_id}",
+        }
+        if cfg.resume:
+            existing_wandb_run_id = load_wandb_run_id(run_dir)
+            if existing_wandb_run_id is not None:
+                local_wandb_step = load_latest_local_wandb_step(Path.cwd() / "wandb", existing_wandb_run_id)
+                checkpoint_step = cfg.resume_step if cfg.resume_step is not None else 0
+                if local_wandb_step is not None and checkpoint_step < local_wandb_step:
+                    print(
+                        "Warning: saved W&B run is ahead of the checkpoint step "
+                        f"({local_wandb_step} > {checkpoint_step}). Starting a new W&B run instead of "
+                        "resuming the old one to avoid out-of-order step logging."
+                    )
+                    wandb_kwargs["resume"] = "allow"
+                else:
+                    wandb_kwargs["id"] = existing_wandb_run_id
+                    wandb_kwargs["resume"] = "must"
+            else:
+                # Fall back to creating a new run if no persisted id is available.
+                wandb_kwargs["resume"] = "allow"
+
+        wandb.init(**wandb_kwargs)
+        if wandb.run is not None:
+            save_wandb_run_id(run_dir, wandb.run.id)
 
     # Print detected constants
     print(
@@ -445,11 +483,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # the `modeling_prismatic.py` file in this codebase; if so, we will copy
     # the file to the downloaded or locally stored checkpoint directory so
     # that the user's changes to the VLA class logic go into effect
-    if model_is_on_hf_hub(cfg.vla_path):
+    model_load_path = base_model_reference
+    if model_is_on_hf_hub(model_load_path):
         # Download model directly from Hugging Face Hub
-        vla_download_path = snapshot_download(repo_id=cfg.vla_path)
-        # Overwrite VLA path
-        cfg.vla_path = vla_download_path
+        model_load_path = snapshot_download(repo_id=model_load_path)
     else:
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
         AutoConfig.register("openvla", OpenVLAConfig)
@@ -459,16 +496,17 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Update config.json and sync model files
     if distributed_state.is_main_process:
-        update_auto_map(cfg.vla_path)
-        check_model_logic_mismatch(cfg.vla_path)
+        update_auto_map(model_load_path)
+        check_model_logic_mismatch(model_load_path)
 
     # Wait for model files to be synced
     dist.barrier()
 
     # Load processor and VLA
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    processor_load_path = cfg.vla_path if cfg.resume else model_load_path
+    processor = AutoProcessor.from_pretrained(processor_load_path, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
+        model_load_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
@@ -486,7 +524,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
+        if recorded_base_model_path is not None and (Path(cfg.vla_path) / "lora_adapter").is_dir():
+            vla = PeftModel.from_pretrained(vla, Path(cfg.vla_path) / "lora_adapter", is_trainable=True)
+        else:
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     # FiLM setup
@@ -585,6 +626,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         optimizer.load_state_dict(trainer_state["optimizer"])
         scheduler.load_state_dict(trainer_state["scheduler"])
         move_optimizer_state_to_device(optimizer, device_id)
+        override_optimizer_and_scheduler_lr(optimizer, scheduler, cfg.learning_rate)
+        original_lr = cfg.learning_rate
         completed_steps = int(trainer_state.get("step", cfg.resume_step))
         if completed_steps != cfg.resume_step:
             print(
@@ -592,6 +635,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 f"({cfg.resume_step}); using trainer state step."
             )
             cfg.resume_step = completed_steps
+        print(f"Overriding resumed optimizer/scheduler learning rate to CLI value: {cfg.learning_rate}")
         print(f"Resuming training from completed step {completed_steps}")
 
     target_step = completed_steps + cfg.max_steps if cfg.resume else cfg.max_steps
@@ -777,6 +821,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             scheduler.step()
             optimizer.zero_grad()
             completed_steps = log_step
+            if distributed_state.is_main_process:
+                progress.set_postfix(
+                    loss=f"{smoothened_metrics.get('loss_value', float('nan')):.4f}",
+                    curr_l1=f"{smoothened_metrics.get('curr_action_l1_loss', float('nan')):.4f}",
+                    next_l1=f"{smoothened_metrics.get('next_actions_l1_loss', float('nan')):.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
             progress.update()
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
@@ -795,6 +846,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     cfg=cfg,
                     run_dir=run_dir,
                     log_step=log_step,
+                    base_model_path=base_model_reference,
                     vla=vla,
                     processor=processor,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,

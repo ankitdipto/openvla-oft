@@ -1,7 +1,6 @@
 """Native LeRobot-backed dataset utilities for RoboCasa/OpenVLA-OFT fine-tuning."""
 
 import json
-import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +23,12 @@ from prismatic.vla.constants import (
     IGNORE_INDEX,
     NUM_ACTIONS_CHUNK,
     NormalizationType,
+)
+from prismatic.vla.datasets.robocasa_utils import (
+    PRIMARY_IMAGE_KEY,
+    WRIST_IMAGE_KEY,
+    extract_action,
+    extract_proprio,
 )
 
 
@@ -80,16 +85,6 @@ class LeRobotBatchTransform:
         if self.use_proprio and sample["observation"].get("proprio") is not None:
             output["proprio"] = sample["observation"]["proprio"]
         return output
-
-
-def quat2axisangle(quat: np.ndarray) -> np.ndarray:
-    quat = np.array(quat, dtype=np.float32, copy=True)
-    quat[3] = np.clip(quat[3], -1.0, 1.0)
-    den = float(np.sqrt(max(1.0 - quat[3] * quat[3], 0.0)))
-    if math.isclose(den, 0.0):
-        return np.zeros(3, dtype=np.float32)
-    return (quat[:3] * 2.0 * math.acos(float(quat[3])) / den).astype(np.float32)
-
 
 class LeRobotDataset(IterableDataset):
     def __init__(
@@ -182,17 +177,10 @@ class LeRobotDataset(IterableDataset):
         return self.data_root_dir / rel_path
 
     def _extract_action(self, action_array: np.ndarray) -> np.ndarray:
-        pos = action_array[:, self.action_slices["end_effector_position"]["start"] : self.action_slices["end_effector_position"]["end"]]
-        rot = action_array[:, self.action_slices["end_effector_rotation"]["start"] : self.action_slices["end_effector_rotation"]["end"]]
-        gripper = action_array[:, self.action_slices["gripper_close"]["start"] : self.action_slices["gripper_close"]["end"]]
-        return np.concatenate((pos, rot, gripper), axis=-1).astype(np.float32)
+        return extract_action(action_array, self.action_slices)
 
     def _extract_proprio(self, state_array: np.ndarray) -> np.ndarray:
-        pos = state_array[:, self.state_slices["end_effector_position_relative"]["start"] : self.state_slices["end_effector_position_relative"]["end"]]
-        quat = state_array[:, self.state_slices["end_effector_rotation_relative"]["start"] : self.state_slices["end_effector_rotation_relative"]["end"]]
-        axis_angle = np.stack([quat2axisangle(q) for q in quat], axis=0)
-        gripper = state_array[:, self.state_slices["gripper_qpos"]["start"] : self.state_slices["gripper_qpos"]["end"]]
-        return np.concatenate((pos, axis_angle, gripper), axis=-1).astype(np.float32)
+        return extract_proprio(state_array, self.state_slices)
 
     def _subset_stats(self, stats: Dict[str, List[float]], indices: List[int]) -> Dict[str, np.ndarray]:
         return {name: np.asarray(values, dtype=np.float32)[indices] for name, values in stats.items()}
@@ -266,10 +254,10 @@ class LeRobotDataset(IterableDataset):
         if usable_steps <= 0:
             return
 
-        primary_cap = cv2.VideoCapture(str(self._episode_video_path(episode_index, "observation.images.robot0_agentview_left")))
+        primary_cap = cv2.VideoCapture(str(self._episode_video_path(episode_index, PRIMARY_IMAGE_KEY)))
         wrist_cap = None
         if self.use_wrist_image:
-            wrist_cap = cv2.VideoCapture(str(self._episode_video_path(episode_index, "observation.images.robot0_eye_in_hand")))
+            wrist_cap = cv2.VideoCapture(str(self._episode_video_path(episode_index, WRIST_IMAGE_KEY)))
 
         try:
             for step_idx in range(usable_steps):

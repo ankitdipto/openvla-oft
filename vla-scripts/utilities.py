@@ -1,17 +1,20 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import json
 import os
 import re
+import shutil
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import _LRScheduler
 import torch.distributed as dist
 from peft import PeftModel
 from transformers import AutoModelForVision2Seq
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK, ACTION_DIM
-from prismatic.util.data_utils import save_dataset_statistics
+from prismatic.vla.datasets.statistics import save_dataset_statistics
 
 @dataclass
 class FinetuneConfig:
@@ -56,19 +59,34 @@ class FinetuneConfig:
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
     lora_rank: int = 32                              # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
-    merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
-                                                     #   Note: Merging can be very slow on some machines. If so, set to
-                                                     #         False and merge final checkpoint offline!
+    merge_lora_during_training: bool = False         # If True, merges LoRA weights and saves result during training
+                                                     #   Note: Merging is slow and best avoided for routine checkpoints.
+                                                     #         Leave this False for fast resumable checkpoints and merge
+                                                     #         final checkpoints offline when needed.
 
     # Logging
-    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
-    wandb_project: str = "your-wandb-project"        # Name of WandB project
+    wandb_entity: str = "ankitdipto"          # Name of WandB entity
+    wandb_project: str = "VLA-RL"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
     log_step_timing: bool = False                    # If True, prints wall-clock timing for each training iteration
 
     # fmt: on
+
+
+def get_base_model_path_metadata_path(checkpoint_dir: Path) -> Path:
+    """Return the metadata file used to persist the original base-model path for adapter-only checkpoints."""
+    return checkpoint_dir / "base_model_path.txt"
+
+
+def load_base_model_path_from_checkpoint(checkpoint_dir: str | Path) -> Optional[str]:
+    """Load the original base-model path recorded alongside an adapter-only checkpoint."""
+    metadata_path = get_base_model_path_metadata_path(Path(checkpoint_dir))
+    if not metadata_path.exists():
+        return None
+    base_model_path = metadata_path.read_text().strip()
+    return base_model_path or None
 
 
 def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
@@ -143,6 +161,18 @@ def move_optimizer_state_to_device(optimizer: AdamW, device_id: int) -> None:
             if torch.is_tensor(value):
                 state[key] = value.to(device)
 
+
+def override_optimizer_and_scheduler_lr(optimizer: AdamW, scheduler: _LRScheduler, learning_rate: float) -> None:
+    """Force the resumed optimizer/scheduler to use the CLI-provided learning rate."""
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+        param_group["initial_lr"] = learning_rate
+
+    if hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [learning_rate for _ in scheduler.base_lrs]
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = [learning_rate for _ in scheduler._last_lr]
+
 def remove_ddp_in_checkpoint(state_dict) -> dict:
     """
     Removes the 'module.' prefix from parameter names in a PyTorch model state dictionary that was saved using
@@ -200,6 +230,49 @@ def get_run_id(cfg) -> str:
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
+
+
+def get_wandb_run_id_path(run_dir: Path) -> Path:
+    """Return the file path used to persist the W&B run id for resumable logging."""
+    return run_dir / "wandb_run_id.txt"
+
+
+def load_wandb_run_id(run_dir: Path) -> Optional[str]:
+    """Load a previously persisted W&B run id if one exists."""
+    path = get_wandb_run_id_path(run_dir)
+    if not path.exists():
+        return None
+    run_id = path.read_text().strip()
+    return run_id or None
+
+
+def save_wandb_run_id(run_dir: Path, wandb_run_id: str) -> None:
+    """Persist the active W&B run id alongside the experiment artifacts."""
+    get_wandb_run_id_path(run_dir).write_text(wandb_run_id.strip() + "\n")
+
+
+def load_latest_local_wandb_step(wandb_root: Path, wandb_run_id: str) -> Optional[int]:
+    """Return the maximum locally cached W&B `_step` for a given run id, if available."""
+    if not wandb_run_id:
+        return None
+
+    summary_steps = []
+    for summary_path in wandb_root.glob(f"run-*-{wandb_run_id}/files/wandb-summary.json"):
+        try:
+            summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        step = summary.get("_step")
+        if step is not None:
+            try:
+                summary_steps.append(int(step))
+            except (TypeError, ValueError):
+                continue
+
+    if not summary_steps:
+        return None
+    return max(summary_steps)
 
 
 
@@ -365,10 +438,67 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     wandb_entity.log(log_dict, step=step)
 
 
+def _get_latest_checkpoint_symlink_path(run_dir: Path) -> Path:
+    """Return the stable symlink path for the latest completed checkpoint."""
+    return Path(str(run_dir) + "--latest_chkpt")
+
+
+def _get_numbered_checkpoint_dir(run_dir: Path, log_step: int) -> Path:
+    """Return the numbered checkpoint directory for a given training step."""
+    return Path(str(run_dir) + f"--{log_step}_chkpt")
+
+
+def _get_temp_checkpoint_dir(final_checkpoint_dir: Path) -> Path:
+    """Return the temporary directory used while assembling a checkpoint."""
+    return Path(str(final_checkpoint_dir) + ".tmp")
+
+
+def _get_latest_checkpoint_target(run_dir: Path) -> Optional[Path]:
+    """Return the previous completed checkpoint pointed to by the latest symlink, if any."""
+    latest_symlink = _get_latest_checkpoint_symlink_path(run_dir)
+    if not latest_symlink.is_symlink():
+        return None
+
+    target = os.readlink(latest_symlink)
+    target_path = Path(target)
+    if not target_path.is_absolute():
+        target_path = latest_symlink.parent / target_path
+    return target_path.resolve()
+
+
+def _update_latest_checkpoint_symlink(run_dir: Path, final_checkpoint_dir: Path) -> Optional[Path]:
+    """
+    Atomically point the stable latest-checkpoint symlink to the newest completed numbered checkpoint.
+
+    This keeps the previous latest checkpoint intact until the new checkpoint directory is fully written.
+    """
+    latest_symlink = _get_latest_checkpoint_symlink_path(run_dir)
+    previous_checkpoint_dir = _get_latest_checkpoint_target(run_dir)
+
+    # Preserve any legacy real directory from the old overwrite-in-place scheme.
+    if latest_symlink.exists() and not latest_symlink.is_symlink():
+        legacy_path = latest_symlink.with_name(latest_symlink.name + ".legacy")
+        suffix = 1
+        while legacy_path.exists():
+            legacy_path = latest_symlink.with_name(latest_symlink.name + f".legacy.{suffix}")
+            suffix += 1
+        os.replace(latest_symlink, legacy_path)
+
+    tmp_symlink = latest_symlink.with_name(latest_symlink.name + ".tmp-link")
+    if tmp_symlink.exists() or tmp_symlink.is_symlink():
+        tmp_symlink.unlink()
+
+    target_name = os.path.basename(final_checkpoint_dir)
+    os.symlink(target_name, tmp_symlink)
+    os.replace(tmp_symlink, latest_symlink)
+    return previous_checkpoint_dir
+
+
 def save_training_checkpoint(
     cfg,
     run_dir,
     log_step,
+    base_model_path,
     vla,
     processor,
     proprio_projector,
@@ -397,24 +527,21 @@ def save_training_checkpoint(
     Returns:
         None.
     """
-    # Determine checkpoint paths and naming
-    if cfg.save_latest_checkpoint_only:
-        checkpoint_dir = run_dir
-        checkpoint_name_suffix = "latest_checkpoint.pt"
-    elif cfg.overwrite_prev_checkpoint_after_first and log_step > cfg.save_freq:
-        checkpoint_dir = Path(str(run_dir) + "--latest_chkpt")
-        checkpoint_name_suffix = "latest_checkpoint.pt"
-    else:
-        checkpoint_dir = Path(str(run_dir) + f"--{log_step}_chkpt")
-        checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
-
-    adapter_dir = checkpoint_dir / "lora_adapter"
+    # Always save into a fresh numbered checkpoint directory first.
+    # This avoids corrupting the last good checkpoint if the job is terminated during save.
+    final_checkpoint_dir = _get_numbered_checkpoint_dir(run_dir, log_step)
+    temp_checkpoint_dir = _get_temp_checkpoint_dir(final_checkpoint_dir)
+    checkpoint_name_suffix = "latest_checkpoint.pt"
+    adapter_dir = temp_checkpoint_dir / "lora_adapter"
 
     # Create directories and save dataset statistics (main process only)
     if distributed_state.is_main_process:
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if temp_checkpoint_dir.exists():
+            shutil.rmtree(temp_checkpoint_dir)
+        os.makedirs(temp_checkpoint_dir, exist_ok=True)
         os.makedirs(adapter_dir, exist_ok=True)
-        save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
+        save_dataset_statistics(train_dataset.dataset_statistics, temp_checkpoint_dir)
+        get_base_model_path_metadata_path(temp_checkpoint_dir).write_text(str(base_model_path).strip() + "\n")
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
@@ -423,25 +550,29 @@ def save_training_checkpoint(
     # Save model components (main process only)
     if distributed_state.is_main_process:
         # Save processor and LoRA adapter
-        processor.save_pretrained(checkpoint_dir)
+        processor.save_pretrained(temp_checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
-            torch.save(proprio_projector.state_dict(), checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}")
+            torch.save(
+                proprio_projector.state_dict(), temp_checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}"
+            )
 
         if cfg.use_diffusion and noisy_action_projector is not None:
             torch.save(
-                noisy_action_projector.state_dict(), checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
+                noisy_action_projector.state_dict(),
+                temp_checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}",
             )
 
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
-            torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
+            torch.save(action_head.state_dict(), temp_checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
-                vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
+                vla.module.vision_backbone.state_dict(),
+                temp_checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}",
             )
 
         torch.save(
@@ -450,24 +581,29 @@ def save_training_checkpoint(
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
             },
-            checkpoint_dir / f"trainer_state--{checkpoint_name_suffix}",
+            temp_checkpoint_dir / f"trainer_state--{checkpoint_name_suffix}",
         )
 
     # Wait for model components to be saved
     dist.barrier()
 
-    # Merge LoRA weights into base model and save resulting model checkpoint
-    # Note: Can be very slow on some devices; if so, we recommend merging offline
-    if cfg.use_lora and cfg.merge_lora_during_training:
-        base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-        )
-        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-        merged_vla = merged_vla.merge_and_unload()
+    # Finalize checkpoint directory and atomically advance the latest symlink.
+    if distributed_state.is_main_process:
+        if cfg.use_lora and cfg.merge_lora_during_training:
+            base_vla = AutoModelForVision2Seq.from_pretrained(
+                base_model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+            )
+            merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+            merged_vla = merged_vla.merge_and_unload()
+            merged_vla.save_pretrained(temp_checkpoint_dir)
+            print(f"Saved merged model for Step {log_step} at: {temp_checkpoint_dir}")
 
-        if distributed_state.is_main_process:
-            merged_vla.save_pretrained(checkpoint_dir)
-            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+        if final_checkpoint_dir.exists():
+            shutil.rmtree(final_checkpoint_dir)
+        os.replace(temp_checkpoint_dir, final_checkpoint_dir)
+        previous_checkpoint_dir = _update_latest_checkpoint_symlink(run_dir, final_checkpoint_dir)
+        if previous_checkpoint_dir is not None and previous_checkpoint_dir != final_checkpoint_dir:
+            shutil.rmtree(previous_checkpoint_dir, ignore_errors=True)
+        print(f"Checkpoint for Step {log_step} finalized at: {final_checkpoint_dir}")
 
-        # Wait for merged model to be saved
-        dist.barrier()
+    dist.barrier()

@@ -2,7 +2,7 @@
   "include": ["**/*.py"],
   "exclude": ["**/__pycache__"],
   "typeCheckingMode": "basic",
-  "reportMissingImports": "warning",
+  "reportMissingImports": "error",
   "pythonVersion": "3.10",
   "extraPaths": [
     "../robocasa",

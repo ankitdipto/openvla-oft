@@ -1,9 +1,4 @@
-"""
-run_robocasa_eval.py
-
-Thin evaluation harness for running OpenVLA / OpenVLA-OFT checkpoints on a
-single RoboCasa task without importing the TFDS / RLDS training stack.
-"""
+"""Evaluate RoboCasa-trained OpenVLA-OFT checkpoints on live RoboCasa tasks."""
 
 import logging
 import os
@@ -14,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import draccus
 import imageio
@@ -44,12 +39,14 @@ from experiments.robot.robot_utils import (
     get_action,
     get_image_resize_size,
     get_model,
-    invert_gripper_action,
-    normalize_gripper_action,
     set_seed_everywhere,
 )
-from prismatic.vla.constants import NUM_ACTIONS_CHUNK
-from robosuite.utils.transform_utils import quat2axisangle
+from prismatic.vla.constants import NUM_ACTIONS_CHUNK, PROPRIO_DIM
+from prismatic.vla.datasets.robocasa_utils import (
+    action_to_env_action,
+    observation_from_env,
+    task_description_from_env_obs,
+)
 
 
 logging.basicConfig(
@@ -97,26 +94,21 @@ class GenerateConfig:
     num_diffusion_steps_train: int = 50
     num_diffusion_steps_inference: int = 50
     use_film: bool = False
-    num_images_in_input: int = 2
-    use_proprio: bool = True
+    num_images_in_input: int = 1
+    use_proprio: bool = False
     center_crop: bool = True
     num_open_loop_steps: int = 1
     lora_rank: int = 32
-    unnorm_key: str = "libero_spatial_no_noops"
+    dataset_name: str = "robocasa_pickplace_counter_to_cabinet"
+    unnorm_key: Optional[str] = None
     load_in_8bit: bool = False
     load_in_4bit: bool = False
 
     # RoboCasa
     task_name: str = "PickPlaceCounterToCabinet"
-    split: str = "pretrain"
+    split: str = "target"
     num_trials: int = 5
     max_steps: int = 300
-    action_scale_pos: float = 1.0
-    action_scale_rot: float = 1.0
-    action_clip_pos: float = 0.05
-    action_clip_rot: float = 0.25
-    base_motion_scale: float = 0.0
-    control_mode: float = 0.0
 
     # Logging
     run_id_note: Optional[str] = None
@@ -134,6 +126,7 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint, "pretrained_checkpoint must not be empty!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
     assert cfg.num_open_loop_steps >= 1, "num_open_loop_steps must be >= 1"
+    assert cfg.num_images_in_input in (1, 2), "RoboCasa eval currently supports 1 or 2 images"
 
 
 def setup_logging(cfg: GenerateConfig):
@@ -173,51 +166,27 @@ def make_robocasa_env(cfg: GenerateConfig):
     return RoboCasaGymEnv(env_name=cfg.task_name, split=cfg.split, enable_render=True)
 
 
-def prepare_observation(obs, resize_size, use_proprio: bool):
-    full_image = resize_image_for_policy(obs["video.robot0_agentview_left"], resize_size)
-    wrist_image = resize_image_for_policy(obs["video.robot0_eye_in_hand"], resize_size)
-
-    observation = {
-        "full_image": full_image,
-        "wrist_image": wrist_image,
-    }
-
-    if use_proprio:
-        proprio = np.concatenate(
-            (
-                obs["state.end_effector_position_relative"],
-                quat2axisangle(obs["state.end_effector_rotation_relative"]),
-                obs["state.gripper_qpos"],
-            )
-        ).astype(np.float32)
-        observation["state"] = proprio
-
-    return observation
+def prepare_observation(obs: Dict[str, Any], resize_size: int, cfg: GenerateConfig) -> Dict[str, Any]:
+    return observation_from_env(
+        obs,
+        use_wrist_image=cfg.num_images_in_input > 1,
+        use_proprio=cfg.use_proprio,
+        image_resize_size=resize_size,
+        image_resize_fn=resize_image_for_policy,
+    )
 
 
-def get_task_description(obs) -> str:
-    return obs["annotation.human.task_description"]
-
-
-def process_action(action: np.ndarray, cfg: GenerateConfig) -> dict:
-    action = normalize_gripper_action(action, binarize=True)
-    if cfg.model_family == "openvla":
-        action = invert_gripper_action(action)
-
-    pos = np.clip(action[:3] * cfg.action_scale_pos, -cfg.action_clip_pos, cfg.action_clip_pos).astype(np.float32)
-    rot = np.clip(action[3:6] * cfg.action_scale_rot, -cfg.action_clip_rot, cfg.action_clip_rot).astype(np.float32)
-    gripper = np.array([action[6]], dtype=np.float32)
-    base_motion = np.zeros(4, dtype=np.float32)
-    if cfg.base_motion_scale != 0:
-        base_motion *= cfg.base_motion_scale
-
-    return {
-        "action.end_effector_position": pos,
-        "action.end_effector_rotation": rot,
-        "action.gripper_close": gripper,
-        "action.base_motion": base_motion,
-        "action.control_mode": np.array([cfg.control_mode], dtype=np.float32),
-    }
+def resolve_unnorm_key(cfg: GenerateConfig, model: Any) -> str:
+    requested = cfg.unnorm_key or cfg.dataset_name
+    norm_stats = getattr(model, "norm_stats", None) or {}
+    if requested in norm_stats:
+        return requested
+    if len(norm_stats) == 1:
+        return next(iter(norm_stats))
+    available = ", ".join(sorted(norm_stats.keys())) or "none"
+    raise ValueError(
+        f"Could not resolve unnorm_key `{requested}` from checkpoint statistics; available keys: {available}"
+    )
 
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
@@ -256,14 +225,15 @@ def run_episode(
     log_file=None,
 ):
     obs, _ = env.reset(seed=cfg.seed + episode_idx)
-    task_description = get_task_description(obs)
+    task_description = task_description_from_env_obs(obs)
+    print("Task description: ", task_description)
     action_queue = deque(maxlen=max(cfg.num_open_loop_steps, NUM_ACTIONS_CHUNK))
 
     replay_images = []
     success = False
 
     for t in range(cfg.max_steps):
-        observation = prepare_observation(obs, resize_size, cfg.use_proprio)
+        observation = prepare_observation(obs, resize_size, cfg)
         replay_images.append(compose_rollout_frame(obs))
 
         if len(action_queue) == 0:
@@ -282,7 +252,7 @@ def run_episode(
                 action_queue.append(act)
             log_message(f"episode={episode_idx} t={t}: queried policy for {len(actions)} actions", log_file)
 
-        env_action = process_action(action_queue.popleft(), cfg)
+        env_action = action_to_env_action(action_queue.popleft())
         obs, reward, terminated, truncated, info = env.step(env_action)
 
         if info.get("success", False):
@@ -316,7 +286,7 @@ def initialize_model(cfg: GenerateConfig):
 
     proprio_projector = None
     if cfg.use_proprio:
-        proprio_projector = get_proprio_projector(cfg, model.llm_dim, proprio_dim=8)
+        proprio_projector = get_proprio_projector(cfg, model.llm_dim, proprio_dim=PROPRIO_DIM)
 
     action_head = None
     if cfg.use_l1_regression or cfg.use_diffusion:
@@ -339,7 +309,9 @@ def eval_robocasa(cfg: GenerateConfig) -> float:
     log_message(f"Evaluating task `{cfg.task_name}` on RoboCasa split `{cfg.split}`", log_file)
 
     model, processor, action_head, proprio_projector, noisy_action_projector = initialize_model(cfg)
+    cfg.unnorm_key = resolve_unnorm_key(cfg, model)
     resize_size = get_image_resize_size(cfg)
+    log_message(f"Using unnorm_key `{cfg.unnorm_key}`", log_file)
 
     env = make_robocasa_env(cfg)
     successes = 0
