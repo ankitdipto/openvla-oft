@@ -12,6 +12,13 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import _LRScheduler
 import torch.distributed as dist
 from peft import PeftModel
+
+# Keep helper utilities on the PyTorch-only Transformers path. This env may
+# intentionally omit or break TensorFlow because the RoboCasa workflow here does
+# not depend on the TFDS/RLDS stack.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
 from transformers import AutoModelForVision2Seq
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK, ACTION_DIM
 from prismatic.vla.datasets.statistics import save_dataset_statistics

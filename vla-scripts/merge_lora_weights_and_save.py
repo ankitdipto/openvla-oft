@@ -30,11 +30,17 @@ from typing import Union
 import draccus
 import torch
 from peft import PeftModel
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
+# Keep this script on the PyTorch-only Transformers path. The RoboCasa env may
+# have an intentionally broken TensorFlow stack because training/eval here do
+# not depend on TFDS/RLDS.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
+from transformers import AutoConfig, AutoModelForVision2Seq
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from utilities import load_base_model_path_from_checkpoint
 
 
@@ -63,8 +69,6 @@ def main(cfg: ConvertConfig) -> None:
 
     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
     AutoConfig.register("openvla", OpenVLAConfig)
-    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Load Model using HF AutoClasses
