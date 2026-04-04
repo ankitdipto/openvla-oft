@@ -153,3 +153,6 @@ rollouts/
 wandb/
 **/logs/*
 runs/*
+
+launch_finetune.sh
+vla-scripts/scratchpad.py
