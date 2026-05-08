@@ -5,6 +5,13 @@ import json
 import os
 import re
 import shutil
+
+# Keep helper utilities on the PyTorch-only Transformers path. This env may
+# intentionally omit or break TensorFlow because the RoboCasa workflow here does
+# not depend on the TFDS/RLDS stack.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -12,12 +19,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import _LRScheduler
 import torch.distributed as dist
 from peft import PeftModel
-
-# Keep helper utilities on the PyTorch-only Transformers path. This env may
-# intentionally omit or break TensorFlow because the RoboCasa workflow here does
-# not depend on the TFDS/RLDS stack.
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
 from transformers import AutoModelForVision2Seq
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK, ACTION_DIM
@@ -57,6 +58,7 @@ class FinetuneConfig:
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
     overwrite_prev_checkpoint_after_first: bool = True  # If True, keep the first checkpoint and overwrite one rolling
                                                          #   later checkpoint on subsequent saves
+    num_keep_checkpoints: int = 1                    # Number of numbered checkpoints to retain. `0` keeps all.
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
@@ -501,6 +503,37 @@ def _update_latest_checkpoint_symlink(run_dir: Path, final_checkpoint_dir: Path)
     return previous_checkpoint_dir
 
 
+def _list_numbered_checkpoints(run_dir: Path) -> list[Path]:
+    """Return numbered checkpoint directories for a run, sorted by training step."""
+    checkpoint_dirs = []
+    pattern = re.compile(re.escape(run_dir.name) + r"--(\d+)_chkpt$")
+    parent_dir = run_dir.parent
+
+    for candidate in parent_dir.iterdir():
+        if not candidate.is_dir():
+            continue
+        match = pattern.fullmatch(candidate.name)
+        if match:
+            checkpoint_dirs.append((int(match.group(1)), candidate))
+
+    checkpoint_dirs.sort(key=lambda item: item[0])
+    return [path for _, path in checkpoint_dirs]
+
+
+def _prune_numbered_checkpoints(run_dir: Path, num_keep_checkpoints: int) -> None:
+    """Delete older numbered checkpoints, keeping only the newest `num_keep_checkpoints`."""
+    if num_keep_checkpoints == 0:
+        return
+
+    checkpoint_dirs = _list_numbered_checkpoints(run_dir)
+    excess_count = len(checkpoint_dirs) - num_keep_checkpoints
+    if excess_count <= 0:
+        return
+
+    for checkpoint_dir in checkpoint_dirs[:excess_count]:
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+
 def save_training_checkpoint(
     cfg,
     run_dir,
@@ -608,9 +641,8 @@ def save_training_checkpoint(
         if final_checkpoint_dir.exists():
             shutil.rmtree(final_checkpoint_dir)
         os.replace(temp_checkpoint_dir, final_checkpoint_dir)
-        previous_checkpoint_dir = _update_latest_checkpoint_symlink(run_dir, final_checkpoint_dir)
-        if previous_checkpoint_dir is not None and previous_checkpoint_dir != final_checkpoint_dir:
-            shutil.rmtree(previous_checkpoint_dir, ignore_errors=True)
+        _update_latest_checkpoint_symlink(run_dir, final_checkpoint_dir)
+        _prune_numbered_checkpoints(run_dir, cfg.num_keep_checkpoints)
         print(f"Checkpoint for Step {log_step} finalized at: {final_checkpoint_dir}")
 
     dist.barrier()

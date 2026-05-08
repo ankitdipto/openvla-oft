@@ -26,7 +26,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
@@ -59,9 +58,11 @@ from utilities import (
     save_wandb_run_id,
 )
 
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.extern.hf.loading import (
+    load_action_prediction_model,
+    load_prismatic_processor,
+    register_prismatic_auto_classes,
+)
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
@@ -142,6 +143,7 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    action_token_begin_idx=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -202,8 +204,14 @@ def run_forward_pass(
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
-    current_action_mask = get_current_action_mask(ground_truth_token_ids)
-    next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
+    current_action_mask = get_current_action_mask(
+        ground_truth_token_ids,
+        action_token_begin_idx=action_token_begin_idx or action_tokenizer.action_token_begin_idx,
+    )
+    next_actions_mask = get_next_actions_mask(
+        ground_truth_token_ids,
+        action_token_begin_idx=action_token_begin_idx or action_tokenizer.action_token_begin_idx,
+    )
 
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
@@ -361,6 +369,7 @@ def run_validation(
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                action_token_begin_idx=action_tokenizer.action_token_begin_idx,
             )
 
             # Add the loss value to the metrics
@@ -489,10 +498,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         model_load_path = snapshot_download(repo_id=model_load_path)
     else:
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+        register_prismatic_auto_classes()
 
     # Update config.json and sync model files
     if distributed_state.is_main_process:
@@ -504,13 +510,15 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load processor and VLA
     processor_load_path = cfg.vla_path if cfg.resume else model_load_path
-    processor = AutoProcessor.from_pretrained(processor_load_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
+    processor = load_prismatic_processor(processor_load_path, trust_remote_code=True)
+    vla, _ = load_action_prediction_model(
         model_load_path,
+        processor_path=processor_load_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-    ).to(device_id)
+    )
+    vla = vla.to(device_id)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -642,6 +650,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
+    action_token_begin_idx = action_tokenizer.action_token_begin_idx
 
     # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
     #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
@@ -787,6 +796,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                action_token_begin_idx=action_token_begin_idx,
             )
 
             # Normalize loss to account for gradient accumulation

@@ -15,13 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Union
 
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
 import draccus
 import timm
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from timm.models.vision_transformer import LayerScale
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from prismatic.extern.hf.configuration_prismatic import PrismaticConfig
 from prismatic.extern.hf.modeling_prismatic import PrismaticForConditionalGeneration
@@ -41,6 +44,7 @@ class HFConvertConfig:
     output_hf_model_hub_path: str = (                                   # Path to HF Hub Path for "final" HF model
         "TRI-ML/prismatic-siglip-224px-7b"                              #   => huggingface.co/TRI-ML/prismatic-{...}
     )
+    push_to_hub: bool = False                                           # If True, push converted artifacts to HF Hub
 
     # HF Hub Credentials (required for Gated Models like LLaMa-2)
     hf_token: Union[str, Path] = Path(".hf_token")                      # Environment variable or Path to HF Token
@@ -125,12 +129,16 @@ def convert_prismatic_weights_to_hf(cfg: HFConvertConfig) -> None:
         prismatic_config = json.load(f)["model"]
 
     # Create HF PrismaticConfig (`transformers.PretrainedConfig`)
+    base_prismatic_config = PrismaticConfig(llm_backbone_id=prismatic_config["llm_backbone_id"])
+    llm_text_config = AutoConfig.from_pretrained(base_prismatic_config.hf_llm_id, token=cfg.hf_token)
+
     hf_config = PrismaticConfig(
         vision_backbone_id=prismatic_config["vision_backbone_id"],
         llm_backbone_id=prismatic_config["llm_backbone_id"],
         arch_specifier=prismatic_config["arch_specifier"],
         image_resize_strategy=prismatic_config["image_resize_strategy"],
         llm_max_length=prismatic_config["llm_max_length"],
+        text_config=llm_text_config.to_dict(),
         torch_dtype=torch.bfloat16,
     )
 
@@ -140,14 +148,18 @@ def convert_prismatic_weights_to_hf(cfg: HFConvertConfig) -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         hf_config.hf_llm_id, model_max_length=hf_config.llm_max_length, token=cfg.hf_token, padding_side="right"
     )
+    if hf_config.llm_backbone_id.endswith("-extra"):
+        tokenizer.add_tokens([f"<extra_{idx}>" for idx in range(256)], special_tokens=False)
     tokenizer.add_special_tokens({"pad_token": "<PAD>"})
     tokenizer.init_kwargs.pop("add_prefix_space", None)  # Pop to prevent unnecessary warning on reload...
-    assert tokenizer.pad_token_id == hf_config.pad_token_id, "Incorrect Pad Token ID!"
-    assert len(tokenizer) > hf_config.text_config.vocab_size, "Tokenizer vocabulary must be larger than LLM vocabulary!"
 
-    # Patch LLM Config in `hf_config` with vocab_size (+ `hf_config.pad_to_multiple_of`), pad_token_id + validate
-    hf_config.text_config.vocab_size += hf_config.pad_to_multiple_of
-    hf_config.text_config.pad_token_id = hf_config.pad_token_id
+    # Patch LLM Config in `hf_config` with vocab size padded to the expected multiple.
+    padded_vocab_size = len(tokenizer)
+    if padded_vocab_size % hf_config.pad_to_multiple_of != 0:
+        padded_vocab_size += hf_config.pad_to_multiple_of - (padded_vocab_size % hf_config.pad_to_multiple_of)
+    hf_config.text_config.vocab_size = padded_vocab_size
+    hf_config.pad_token_id = tokenizer.pad_token_id
+    hf_config.text_config.pad_token_id = tokenizer.pad_token_id
     hf_config.text_config.torch_dtype = torch.bfloat16
     assert hf_config.text_config.use_cache, "LLM config `use_cache` should be True for inference (set default)!"
 
@@ -226,11 +238,14 @@ def convert_prismatic_weights_to_hf(cfg: HFConvertConfig) -> None:
     PrismaticForConditionalGeneration.register_for_auto_class("AutoModelForVision2Seq")
 
     # Push to Hub
-    print("[*] Pushing Model & Processor to HF Hub")
-    hf_config.push_to_hub(cfg.output_hf_model_hub_path)
-    hf_model.push_to_hub(cfg.output_hf_model_hub_path, max_shard_size="7GB")
-    hf_image_processor.push_to_hub(cfg.output_hf_model_hub_path)
-    hf_processor.push_to_hub(cfg.output_hf_model_hub_path)
+    if cfg.push_to_hub:
+        print("[*] Pushing Model & Processor to HF Hub")
+        hf_config.push_to_hub(cfg.output_hf_model_hub_path)
+        hf_model.push_to_hub(cfg.output_hf_model_hub_path, max_shard_size="7GB")
+        hf_image_processor.push_to_hub(cfg.output_hf_model_hub_path)
+        hf_processor.push_to_hub(cfg.output_hf_model_hub_path)
+    else:
+        print("[*] Skipping HF Hub push")
 
 
 if __name__ == "__main__":

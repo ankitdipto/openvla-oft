@@ -31,7 +31,7 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 # Model image size configuration
 MODEL_IMAGE_SIZES = {
     "openvla": 224,
-    # Add other models as needed
+    "minivla": 224,
 }
 
 
@@ -65,7 +65,7 @@ def get_model(cfg: Any, wrap_diffusion_policy_for_droid: bool = False) -> torch.
     Raises:
         ValueError: If model family is not supported
     """
-    if cfg.model_family == "openvla":
+    if cfg.model_family in {"openvla", "minivla"}:
         model = get_vla(cfg)
     else:
         raise ValueError(f"Unsupported model family: {cfg.model_family}")
@@ -128,7 +128,7 @@ def get_action(
         ValueError: If model family is not supported
     """
     with torch.no_grad():
-        if cfg.model_family == "openvla":
+        if cfg.model_family in {"openvla", "minivla"}:
             action = get_vla_action(
                 cfg=cfg,
                 vla=model,

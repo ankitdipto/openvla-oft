@@ -28,10 +28,8 @@ from prismatic.training.train_utils import (
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
-    ACTION_TOKEN_BEGIN_IDX,
     IGNORE_INDEX,
     NUM_ACTIONS_CHUNK,
-    STOP_INDEX,
     NormalizationType,
 )
 
@@ -430,8 +428,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
     def _process_action_masks(self, labels):
         """Helper to get action masks from labels"""
-        current_action_mask = get_current_action_mask(labels)
-        next_actions_mask = get_next_actions_mask(labels)
+        action_token_begin_idx = getattr(self.config, "action_token_begin_idx", self.config.text_config.vocab_size)
+        current_action_mask = get_current_action_mask(labels, action_token_begin_idx=action_token_begin_idx)
+        next_actions_mask = get_next_actions_mask(labels, action_token_begin_idx=action_token_begin_idx)
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
@@ -731,6 +730,18 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Compute vocab size for de-tokenization -- revert added "multiple of"
         self.vocab_size = self.config.text_config.vocab_size - self.config.pad_to_multiple_of
 
+    def get_action_token_begin_idx(self) -> int:
+        return int(getattr(self.config, "action_token_begin_idx", self.vocab_size))
+
+    def get_stop_token_id(self) -> int:
+        return int(getattr(self.config, "stop_token_id", self.get_action_token_begin_idx() - 1))
+
+    def get_prompt_suffix_token_id(self) -> Optional[int]:
+        prompt_suffix_token_id = getattr(self.config, "prompt_suffix_token_id", None)
+        if prompt_suffix_token_id is None:
+            return None
+        return int(prompt_suffix_token_id)
+
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
         # Add (ACTION_DIM * NUM_ACTIONS_CHUNK) placeholder tokens to input_ids to simulate action tokens
@@ -740,7 +751,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         input_ids = torch.cat([input_ids, placeholder_action_token_ids], dim=-1)
 
         # Add stop token to sequence (needed in non-causal bi-directional self-attention, as it appears at train time)
-        stop_token_id = torch.ones((input_ids.shape[0], 1)).to(input_ids.device).to(input_ids.dtype) * STOP_INDEX
+        stop_token_id = (
+            torch.ones((input_ids.shape[0], 1)).to(input_ids.device).to(input_ids.dtype) * self.get_stop_token_id()
+        )
         input_ids = torch.cat([input_ids, stop_token_id], dim=-1)
 
         # Extend the attention mask to fit the new shape of input
@@ -757,15 +770,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     def _prepare_labels_for_action_prediction(self, labels, input_ids):
         """Creates labels tensor for action prediction if not provided"""
         # Extend labels tensor with fake action labels
-        ARBITRARY_ACTION_TOKEN_IDX = ACTION_TOKEN_BEGIN_IDX + 1
+        arbitrary_action_token_idx = self.get_action_token_begin_idx() + 1
         labels_extension = (
             torch.ones((labels.shape[0], input_ids.shape[-1] - labels.shape[-1])).to(labels.device).to(labels.dtype)
-            * ARBITRARY_ACTION_TOKEN_IDX
+            * arbitrary_action_token_idx
         )
         labels = torch.cat([labels, labels_extension], dim=-1)
 
         # Replace last label token with stop token
-        labels[:, -1] = STOP_INDEX
+        labels[:, -1] = self.get_stop_token_id()
 
         return labels
 
@@ -969,10 +982,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
-        if not torch.all(input_ids[:, -1] == 29871):
-            input_ids = torch.cat(
-                (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
+        prompt_suffix_token_id = self.get_prompt_suffix_token_id()
+        if prompt_suffix_token_id is not None and not torch.all(input_ids[:, -1] == prompt_suffix_token_id):
+            suffix_tokens = torch.full(
+                (input_ids.shape[0], 1),
+                fill_value=prompt_suffix_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
             )
+            input_ids = torch.cat((input_ids, suffix_tokens), dim=1)
 
         pixel_values = kwargs["pixel_values"]
         attention_mask = kwargs["attention_mask"]

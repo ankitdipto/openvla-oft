@@ -4,7 +4,7 @@ action_tokenizer.py
 Extension class; wraps base LLM/VLM tokenizer with logic to discretize and tokenize continuous robot actions.
 """
 
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
@@ -12,7 +12,12 @@ from transformers import PreTrainedTokenizerBase
 
 class ActionTokenizer:
     def __init__(
-        self, tokenizer: PreTrainedTokenizerBase, bins: int = 256, min_action: int = -1, max_action: int = 1
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        bins: int = 256,
+        min_action: int = -1,
+        max_action: int = 1,
+        action_token_begin_idx: Optional[int] = None,
     ) -> None:
         """
         Discretizes continuous robot actions into N bins per dimension and maps to the least used tokens.
@@ -31,9 +36,56 @@ class ActionTokenizer:
         self.bins = np.linspace(min_action, max_action, self.n_bins)
         self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
 
-        # [Contract] Set "action_token_begin_idx" based on `self.tokenizer.vocab_size - (self.n_bins + 1)`
-        #   =>> Assumes we're always overwriting the final `n_bins` tokens of the vocabulary!
-        self.action_token_begin_idx: int = int(self.tokenizer.vocab_size - (self.n_bins + 1))
+        self.action_token_begin_idx: int = self._resolve_action_token_begin_idx(action_token_begin_idx)
+
+    def _resolve_action_token_begin_idx(self, action_token_begin_idx: Optional[int]) -> int:
+        if action_token_begin_idx is not None:
+            return int(action_token_begin_idx)
+
+        # MiniVLA Qwen checkpoints can reserve `<extra_0> ... <extra_255>` for
+        # action prediction. If they exist contiguously, use that explicit range.
+        inferred_extra_begin = self._infer_extra_action_token_begin_idx()
+        if inferred_extra_begin is not None:
+            return inferred_extra_begin
+
+        # Legacy OpenVLA contract: overwrite the final `n_bins` tokens.
+        return int(self.tokenizer.vocab_size - (self.n_bins + 1))
+
+    def _infer_extra_action_token_begin_idx(self) -> Optional[int]:
+        convert_token = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+        if convert_token is None:
+            return None
+
+        extra_token_ids = []
+        for idx in range(self.n_bins):
+            token_id = convert_token(f"<extra_{idx}>")
+            if token_id is None or token_id == self.tokenizer.unk_token_id or token_id < 0:
+                return None
+            extra_token_ids.append(int(token_id))
+
+        expected_ids = list(range(extra_token_ids[0], extra_token_ids[0] + self.n_bins))
+        if extra_token_ids != expected_ids:
+            return None
+
+        # Keep the legacy convention that valid action tokens are those with
+        # ids strictly greater than `action_token_begin_idx`.
+        return extra_token_ids[0] - 1
+
+    @property
+    def action_token_end_idx(self) -> int:
+        return self.action_token_begin_idx + self.n_bins
+
+    @property
+    def stop_token_id(self) -> Optional[int]:
+        return getattr(self.tokenizer, "eos_token_id", None)
+
+    @property
+    def prompt_suffix_token_id(self) -> Optional[int]:
+        # OpenVLA's Llama-family checkpoints expect an extra empty token before
+        # action prediction. Qwen-style checkpoints do not.
+        if self.tokenizer.__class__.__name__ == "LlamaTokenizerFast":
+            return 29871
+        return None
 
     def __call__(self, action: np.ndarray) -> Union[str, List[str]]:
         """Clip & bin actions to *the last `n_bins` tokens* of the vocabulary (e.g., tokenizer.vocab[-256:])."""
@@ -42,9 +94,11 @@ class ActionTokenizer:
 
         # Handle single element vs. batch
         if len(discretized_action.shape) == 1:
-            return self.tokenizer.decode(list(self.tokenizer.vocab_size - discretized_action))
+            token_ids = list(self.action_token_begin_idx + (self.n_bins + 1 - discretized_action))
+            return self.tokenizer.decode(token_ids)
         else:
-            return self.tokenizer.batch_decode((self.tokenizer.vocab_size - discretized_action).tolist())
+            token_ids = self.action_token_begin_idx + (self.n_bins + 1 - discretized_action)
+            return self.tokenizer.batch_decode(token_ids.tolist())
 
     def decode_token_ids_to_actions(self, action_token_ids: np.ndarray) -> np.ndarray:
         """
@@ -62,7 +116,7 @@ class ActionTokenizer:
                     self._bin_centers. Therefore, if i==255, we subtract 1 from it so that it just becomes the index of
                     the last bin center. We implement this simply via clipping between [0, 255 - 1].
         """
-        discretized_actions = self.tokenizer.vocab_size - action_token_ids
+        discretized_actions = self.action_token_begin_idx + self.n_bins + 1 - action_token_ids
         discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
 
         return self.bin_centers[discretized_actions]

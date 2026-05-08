@@ -54,6 +54,10 @@ LLM_BACKBONE_TO_HF_PATH = {
     "mistral-v0.1-7b-instruct": "mistralai/Mistral-7B-Instruct-v0.1",
 
     "phi-2-3b": "microsoft/phi-2",
+    "qwen25-0_5b-instruct": "Qwen/Qwen2.5-0.5B-Instruct",
+    "qwen25-1_5b-instruct": "Qwen/Qwen2.5-1.5B-Instruct",
+    "qwen25-0_5b-extra": "Qwen/Qwen2.5-0.5B-Instruct",
+    "qwen25-1_5b-extra": "Qwen/Qwen2.5-1.5B-Instruct",
 }
 LLM_BACKBONE_TO_HF_METACLASS = {
     "llama2-7b-pure": "llama", "llama2-13b-pure": "llama", "llama2-7b-chat": "llama", "llama2-13b-chat": "llama",
@@ -62,6 +66,10 @@ LLM_BACKBONE_TO_HF_METACLASS = {
     "mistral-v0.1-7b-pure": "mistral", "mistral-v0.1-7b-instruct": "mistral",
 
     "phi-2-3b": "phi",
+    "qwen25-0_5b-instruct": "qwen2",
+    "qwen25-1_5b-instruct": "qwen2",
+    "qwen25-0_5b-extra": "qwen2",
+    "qwen25-1_5b-extra": "qwen2",
 }
 
 VALID_VISION_BACKBONES = set(VISION_BACKBONE_TO_RESOLUTION.keys())
@@ -133,8 +141,14 @@ class OpenVLAConfig(PrismaticConfig):
         self,
         norm_stats: Optional[Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]]] = None,
         n_action_bins: int = 256,
+        action_token_begin_idx: Optional[int] = None,
+        stop_token_id: Optional[int] = None,
+        prompt_suffix_token_id: Optional[int] = None,
         **kwargs: str,
     ) -> None:
         self.norm_stats, self.n_action_bins = norm_stats, n_action_bins
+        self.action_token_begin_idx = action_token_begin_idx
+        self.stop_token_id = stop_token_id
+        self.prompt_suffix_token_id = prompt_suffix_token_id
 
         super().__init__(**kwargs)

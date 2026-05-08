@@ -27,20 +27,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
-import draccus
-import torch
-from peft import PeftModel
-
 # Keep this script on the PyTorch-only Transformers path. The RoboCasa env may
 # have an intentionally broken TensorFlow stack because training/eval here do
 # not depend on TFDS/RLDS.
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
-from transformers import AutoConfig, AutoModelForVision2Seq
+import draccus
+import torch
+from peft import PeftModel
 
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.loading import load_action_prediction_model
 from utilities import load_base_model_path_from_checkpoint
 
 
@@ -67,13 +64,9 @@ def main(cfg: ConvertConfig) -> None:
         ), "Could not infer base checkpoint from base_model_path.txt; please provide --base_checkpoint explicitly."
         base_checkpoint = inferred_base_checkpoint
 
-    # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-    AutoConfig.register("openvla", OpenVLAConfig)
-    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
-
-    # Load Model using HF AutoClasses
+    # Load action-prediction model using the shared OpenVLA / Prismatic loader.
     print(f"Loading base model: {base_checkpoint}")
-    vla = AutoModelForVision2Seq.from_pretrained(
+    vla, _ = load_action_prediction_model(
         base_checkpoint,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,

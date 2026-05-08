@@ -18,11 +18,12 @@ from PIL import Image
 # Keep the evaluation flow on the PyTorch path; otherwise transformers may try
 # to import TensorFlow image helpers opportunistically if TensorFlow is installed.
 os.environ.setdefault("USE_TF", "0")
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.extern.hf.loading import (
+    load_action_prediction_model,
+    load_prismatic_processor,
+    register_prismatic_auto_classes,
+)
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
@@ -81,7 +82,7 @@ def should_use_local_files_only(model_path: str) -> bool:
     return repo_is_cached_locally(model_path)
 
 
-def update_auto_map(pretrained_checkpoint: str) -> None:
+def update_auto_map(pretrained_checkpoint: str, target_model_type: str = "openvla") -> None:
     """
     Update the AutoMap configuration in the checkpoint config.json file.
 
@@ -102,10 +103,16 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
     with open(config_path, "r") as f:
         config = json.load(f)
 
-    desired_auto_map = {
-        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
-        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
-    }
+    if target_model_type == "prismatic":
+        desired_auto_map = {
+            "AutoConfig": "configuration_prismatic.PrismaticConfig",
+            "AutoModelForVision2Seq": "modeling_prismatic.PrismaticForConditionalGeneration",
+        }
+    else:
+        desired_auto_map = {
+            "AutoConfig": "configuration_prismatic.OpenVLAConfig",
+            "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
+        }
     if config.get("auto_map") == desired_auto_map:
         return
 
@@ -300,19 +307,15 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     # will be used as is, with its original modeling logic
     if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+        register_prismatic_auto_classes()
 
         # Update config.json and sync model files
         update_auto_map(cfg.pretrained_checkpoint)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
     # Load the model
-    vla = AutoModelForVision2Seq.from_pretrained(
+    vla, _ = load_action_prediction_model(
         cfg.pretrained_checkpoint,
-        # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
@@ -409,7 +412,7 @@ def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
         )
 
 
-def get_processor(cfg: Any) -> AutoProcessor:
+def get_processor(cfg: Any) -> Any:
     """
     Get the VLA model's Hugging Face processor.
 
@@ -419,7 +422,7 @@ def get_processor(cfg: Any) -> AutoProcessor:
     Returns:
         AutoProcessor: The model's processor
     """
-    return AutoProcessor.from_pretrained(
+    return load_prismatic_processor(
         cfg.pretrained_checkpoint,
         local_files_only=should_use_local_files_only(cfg.pretrained_checkpoint),
         trust_remote_code=True,
